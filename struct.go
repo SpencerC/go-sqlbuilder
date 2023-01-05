@@ -5,10 +5,10 @@ package sqlbuilder
 
 import (
 	"bytes"
+	"database/sql/driver"
 	"math"
 	"reflect"
 	"regexp"
-	"strings"
 )
 
 var (
@@ -22,6 +22,9 @@ var (
 	// FieldOpt is the options for a struct field.
 	// As db column can contain "," in theory, field options should be provided in a separated tag.
 	FieldOpt = "fieldopt"
+
+	// FieldAs is the column alias (AS) for a struct field.
+	FieldAs = "fieldas"
 )
 
 const (
@@ -34,6 +37,8 @@ const (
 
 var optRegex = regexp.MustCompile(`(?P<` + optName + `>\w+)(\((?P<` + optParams + `>.*)\))?`)
 
+var typeOfSQLDriverValuer = reflect.TypeOf((*driver.Valuer)(nil)).Elem()
+
 // Struct represents a struct type.
 //
 // All methods in Struct are thread-safe.
@@ -43,6 +48,7 @@ type Struct struct {
 
 	structType         reflect.Type
 	structFieldsParser structFieldsParser
+	structTag          string
 }
 
 var emptyStruct Struct
@@ -85,56 +91,53 @@ func (s *Struct) WithFieldMapper(mapper FieldMapperFunc) *Struct {
 	return &c
 }
 
+// WithTag sets default tag for all builder methods.
+// For instance, calling s.WithTag("tag").SelectFrom("t") is the same as calling s.SelectFromForTag("t", "tag").
+func (s *Struct) WithTag(tag string) *Struct {
+	c := *s
+	c.structTag = tag
+	return &c
+}
+
 // SelectFrom creates a new `SelectBuilder` with table name.
 // By default, all exported fields of the s are listed as columns in SELECT.
 //
 // Caller is responsible to set WHERE condition to find right record.
 func (s *Struct) SelectFrom(table string, tableNamePrefix bool) *SelectBuilder {
-	return s.SelectFromForTag(table, tableNamePrefix, "")
+	return s.SelectFromForTag(table, tableNamePrefix, s.structTag)
 }
 
 // SelectFromForTag creates a new `SelectBuilder` with table name for a specified tag.
 // By default, all fields of the s tagged with tag are listed as columns in SELECT.
 //
 // Caller is responsible to set WHERE condition to find right record.
-func (s *Struct) SelectFromForTag(
-	table string,
-	tableNamePrefix bool,
-	tag string,
-) *SelectBuilder {
+func (s *Struct) SelectFromForTag(table string, tableNamePrefix bool, tag string) (sb *SelectBuilder) {
 	sf := s.structFieldsParser()
-	sb := s.Flavor.NewSelectBuilder()
+	tagged := sf.Tag(tag)
+
+	sb = s.Flavor.NewSelectBuilder()
 	sb.From(table)
 
-	if sf.taggedFields == nil {
-		return sb
-	}
-
-	fields, ok := sf.taggedFields[tag]
-
-	if ok {
-		fields = s.quoteFields(sf, fields)
-
-		if tableNamePrefix {
-			buf := &bytes.Buffer{}
-			prefixed := make([]string, 0, len(fields))
-
-			for _, field := range fields {
-				buf.WriteString(table)
-				buf.WriteRune('.')
-				buf.WriteString(field)
-				prefixed = append(prefixed, buf.String())
-				buf.Reset()
-			}
-
-			sb.Select(prefixed...)
-		} else {
-			sb.Select(fields...)
-		}
-	} else {
+	if tagged == nil {
 		sb.Select("*")
+		return
 	}
 
+	buf := &bytes.Buffer{}
+	cols := make([]string, 0, len(tagged.ForRead))
+
+	for _, sf := range tagged.ForRead {
+		if tableNamePrefix {
+			buf.WriteString(table)
+			buf.WriteRune('.')
+		}
+		buf.WriteString(sf.NameForSelect(s.Flavor))
+
+		cols = append(cols, buf.String())
+		buf.Reset()
+	}
+
+	sb.Select(cols...)
 	return sb
 }
 
@@ -144,7 +147,7 @@ func (s *Struct) SelectFromForTag(
 //
 // Caller is responsible to set WHERE condition to match right record.
 func (s *Struct) Update(table string, value interface{}) *UpdateBuilder {
-	return s.UpdateForTag(table, "", value)
+	return s.UpdateForTag(table, s.structTag, value)
 }
 
 // UpdateForTag creates a new `UpdateBuilder` with table name.
@@ -152,22 +155,14 @@ func (s *Struct) Update(table string, value interface{}) *UpdateBuilder {
 // If value's type is not the same as that of s, UpdateForTag returns a dummy `UpdateBuilder` with table name.
 //
 // Caller is responsible to set WHERE condition to match right record.
-func (s *Struct) UpdateForTag(
-	table string,
-	tag string,
-	value interface{},
-) *UpdateBuilder {
-	sf := s.structFieldsParser()
+func (s *Struct) UpdateForTag(table string, tag string, value interface{}) *UpdateBuilder {
+	sfs := s.structFieldsParser()
+	tagged := sfs.Tag(tag)
+
 	ub := s.Flavor.NewUpdateBuilder()
 	ub.Update(table)
 
-	if sf.taggedFields == nil {
-		return ub
-	}
-
-	fields, ok := sf.taggedFields[tag]
-
-	if !ok {
+	if tagged == nil {
 		return ub
 	}
 
@@ -178,25 +173,22 @@ func (s *Struct) UpdateForTag(
 		return ub
 	}
 
-	quoted := s.quoteFields(sf, fields)
-	assignments := make([]string, 0, len(fields))
+	assignments := make([]string, 0, len(tagged.ForWrite))
 
-	for i, f := range fields {
-		name := sf.fieldAlias[f]
+	for _, sf := range tagged.ForWrite {
+		name := sf.Name
 		val := v.FieldByName(name)
 
 		if isEmptyValue(val) {
-			if omitEmptyTagMap, ok := sf.omitEmptyFields[f]; ok {
-				if omitEmptyTagMap.containsAny("", tag) {
-					continue
-				}
+			if sf.ShouldOmitEmpty("", tag) {
+				continue
 			}
 		} else {
-			val = dereferencedValue(val)
+			val = dereferencedFieldValue(val)
 		}
 
 		data := val.Interface()
-		assignments = append(assignments, ub.Assign(quoted[i], data))
+		assignments = append(assignments, ub.Assign(sf.Quote(s.Flavor), data))
 	}
 
 	ub.Set(assignments...)
@@ -211,7 +203,7 @@ func (s *Struct) UpdateForTag(
 // If the type of any item in value is not expected, it will be ignored.
 // If value is an empty slice, `InsertBuilder#Values` will not be called.
 func (s *Struct) InsertInto(table string, value ...interface{}) *InsertBuilder {
-	return s.InsertIntoForTag(table, "", value...)
+	return s.InsertIntoForTag(table, s.structTag, value...)
 }
 
 // InsertIgnoreInto creates a new `InsertBuilder` with table name using verb INSERT IGNORE INTO.
@@ -225,7 +217,7 @@ func (s *Struct) InsertIgnoreInto(
 	table string,
 	value ...interface{},
 ) *InsertBuilder {
-	return s.InsertIgnoreIntoForTag(table, "", value...)
+	return s.InsertIgnoreIntoForTag(table, s.structTag, value...)
 }
 
 // ReplaceInto creates a new `InsertBuilder` with table name using verb REPLACE INTO.
@@ -239,7 +231,7 @@ func (s *Struct) ReplaceInto(
 	table string,
 	value ...interface{},
 ) *InsertBuilder {
-	return s.ReplaceIntoForTag(table, "", value...)
+	return s.ReplaceIntoForTag(table, s.structTag, value...)
 }
 
 // buildColsAndValuesForTag uses ib to set exported fields tagged with tag as columns
@@ -249,15 +241,10 @@ func (s *Struct) buildColsAndValuesForTag(
 	tag string,
 	value ...interface{},
 ) {
-	sf := s.structFieldsParser()
+	sfs := s.structFieldsParser()
+	tagged := sfs.Tag(tag)
 
-	if sf.taggedFields == nil {
-		return
-	}
-
-	fields, ok := sf.taggedFields[tag]
-
-	if !ok {
+	if tagged == nil {
 		return
 	}
 
@@ -265,7 +252,7 @@ func (s *Struct) buildColsAndValuesForTag(
 
 	for _, item := range value {
 		v := reflect.ValueOf(item)
-		v = dereferencedValue(v)
+		v = dereferencedFieldValue(v)
 
 		if v.Type() == s.structType {
 			vs = append(vs, v)
@@ -276,29 +263,24 @@ func (s *Struct) buildColsAndValuesForTag(
 		return
 	}
 
-	cols := make([]string, 0, len(fields))
+	cols := make([]string, 0, len(tagged.ForWrite))
 	values := make([][]interface{}, len(vs))
-	nilCols := make([]int, len(fields))
+	nilCols := make([]int, 0, len(tagged.ForWrite))
 
-	for idx, f := range fields {
-		cols = append(cols, f)
-		name := sf.fieldAlias[f]
-		shouldOmitempty := false
-
-		if omitEmptyTagMap, ok := sf.omitEmptyFields[f]; ok {
-			if omitEmptyTagMap.containsAny("", tag) {
-				shouldOmitempty = true
-			}
-		}
+	for _, sf := range tagged.ForWrite {
+		cols = append(cols, sf.Quote(s.Flavor))
+		name := sf.Name
+		shouldOmitEmpty := sf.ShouldOmitEmpty("", tag)
+		nilCnt := 0
 
 		for i, v := range vs {
 			val := v.FieldByName(name)
 
-			if isEmptyValue(val) && shouldOmitempty {
-				nilCols[idx]++
+			if isEmptyValue(val) && shouldOmitEmpty {
+				nilCnt++
 			}
 
-			val = dereferencedValue(val)
+			val = dereferencedFieldValue(val)
 
 			if val.IsValid() {
 				values[i] = append(values[i], val.Interface())
@@ -306,6 +288,8 @@ func (s *Struct) buildColsAndValuesForTag(
 				values[i] = append(values[i], nil)
 			}
 		}
+
+		nilCols = append(nilCols, nilCnt)
 	}
 
 	// Try to filter out nil values if possible.
@@ -325,7 +309,6 @@ func (s *Struct) buildColsAndValuesForTag(
 		}
 	}
 
-	filteredCols = s.quoteFields(sf, filteredCols)
 	ib.Cols(filteredCols...)
 
 	for _, value := range filteredValues {
@@ -399,48 +382,58 @@ func (s *Struct) DeleteFrom(table string) *DeleteBuilder {
 	return db
 }
 
-// Addr takes address of all exported fields of the s from the value.
+// Addr takes address of all exported fields of the s from the st.
 // The returned result can be used in `Row#Scan` directly.
-func (s *Struct) Addr(value interface{}) []interface{} {
-	return s.AddrForTag("", value)
+func (s *Struct) Addr(st interface{}) []interface{} {
+	return s.AddrForTag(s.structTag, st)
 }
 
-// AddrForTag takes address of all fields of the s tagged with tag from the value.
-// The returned result can be used in `Row#Scan` directly.
+// AddrForTag takes address of all fields of the s tagged with tag from the st.
+// The returned value can be used in `Row#Scan` directly.
 //
-// If tag is not defined in s in advance,
-func (s *Struct) AddrForTag(tag string, value interface{}) []interface{} {
-	sf := s.structFieldsParser()
-	fields, ok := sf.taggedFields[tag]
+// If tag is not defined in s in advance, returns nil.
+func (s *Struct) AddrForTag(tag string, st interface{}) []interface{} {
+	sfs := s.structFieldsParser()
+	tagged := sfs.Tag(tag)
 
-	if !ok {
+	if tagged == nil {
 		return nil
 	}
 
-	return s.AddrWithCols(fields, value)
+	return s.addrWithFields(tagged.ForRead, st)
 }
 
-// AddrWithCols takes address of all columns defined in cols from the value.
-// The returned result can be used in `Row#Scan` directly.
-func (s *Struct) AddrWithCols(cols []string, value interface{}) []interface{} {
-	sf := s.structFieldsParser()
-	v := reflect.ValueOf(value)
+// AddrWithCols takes address of all columns defined in cols from the st.
+// The returned value can be used in `Row#Scan` directly.
+func (s *Struct) AddrWithCols(cols []string, st interface{}) []interface{} {
+	sfs := s.structFieldsParser()
+	tagged := sfs.Tag(s.structTag)
+
+	if tagged == nil {
+		return nil
+	}
+
+	fields := tagged.Cols(cols)
+
+	if fields == nil {
+		return nil
+	}
+
+	return s.addrWithFields(fields, st)
+}
+
+func (s *Struct) addrWithFields(fields []*structField, st interface{}) []interface{} {
+	v := reflect.ValueOf(st)
 	v = dereferencedValue(v)
 
 	if v.Type() != s.structType {
 		return nil
 	}
 
-	for _, c := range cols {
-		if _, ok := sf.fieldAlias[c]; !ok {
-			return nil
-		}
-	}
+	addrs := make([]interface{}, 0, len(fields))
 
-	addrs := make([]interface{}, 0, len(cols))
-
-	for _, c := range cols {
-		name := sf.fieldAlias[c]
+	for _, sf := range fields {
+		name := sf.Name
 		data := v.FieldByName(name).Addr().Interface()
 		addrs = append(addrs, data)
 	}
@@ -448,62 +441,58 @@ func (s *Struct) AddrWithCols(cols []string, value interface{}) []interface{} {
 	return addrs
 }
 
-func (s *Struct) quoteFields(sf *structFields, fields []string) []string {
-	// Try best not to allocate new slice.
-	if len(sf.quotedFields) == 0 {
-		return fields
-	}
-
-	needQuote := false
-
-	for _, field := range fields {
-		if _, ok := sf.quotedFields[field]; ok {
-			needQuote = true
-			break
-		}
-	}
-
-	if !needQuote {
-		return fields
-	}
-
-	quoted := make([]string, 0, len(fields))
-
-	for _, field := range fields {
-		if _, ok := sf.quotedFields[field]; ok {
-			quoted = append(quoted, s.Flavor.Quote(field))
-		} else {
-			quoted = append(quoted, field)
-		}
-	}
-
-	return quoted
+// Columns returns column names of s for all exported struct fields.
+func (s *Struct) Columns() []string {
+	return s.ColumnsForTag(s.structTag)
 }
 
-func getOptMatchedMap(opt string) (res map[string]string) {
-	res = map[string]string{}
-	sm := optRegex.FindStringSubmatch(opt)
-	for i, name := range optRegex.SubexpNames() {
-		if name != "" {
-			res[name] = sm[i]
-		}
+// ColumnsForTag returns column names of the s tagged with tag.
+func (s *Struct) ColumnsForTag(tag string) (cols []string) {
+	sfs := s.structFieldsParser()
+	tagged := sfs.Tag(tag)
+
+	if tagged == nil {
+		return
 	}
+
+	cols = make([]string, 0, len(tagged.ForWrite))
+
+	for _, sf := range tagged.ForWrite {
+		cols = append(cols, sf.Alias)
+	}
+
 	return
 }
 
-func getTagsFromOptParams(opts string) (tags []string) {
-	tags = splitTokens(opts)
-	if len(tags) == 0 {
-		tags = append(tags, "")
-	}
-	return
+// Values returns a shadow copy of all exported fields in st.
+func (s *Struct) Values(st interface{}) []interface{} {
+	return s.ValuesForTag(s.structTag, st)
 }
 
-func splitTokens(fieldtag string) (res []string) {
-	res = strings.Split(fieldtag, ",")
-	for i, v := range res {
-		res[i] = strings.TrimSpace(v)
+// ValuesForTag returns a shadow copy of all fields tagged with tag in st.
+func (s *Struct) ValuesForTag(tag string, value interface{}) (values []interface{}) {
+	sfs := s.structFieldsParser()
+	tagged := sfs.Tag(tag)
+
+	if tagged == nil {
+		return
 	}
+
+	v := reflect.ValueOf(value)
+	v = dereferencedValue(v)
+
+	if v.Type() != s.structType {
+		return
+	}
+
+	values = make([]interface{}, 0, len(tagged.ForWrite))
+
+	for _, sf := range tagged.ForWrite {
+		name := sf.Name
+		data := v.FieldByName(name).Interface()
+		values = append(values, data)
+	}
+
 	return
 }
 
@@ -517,6 +506,18 @@ func dereferencedType(t reflect.Type) reflect.Type {
 
 func dereferencedValue(v reflect.Value) reflect.Value {
 	for k := v.Kind(); k == reflect.Ptr || k == reflect.Interface; k = v.Kind() {
+		v = v.Elem()
+	}
+
+	return v
+}
+
+func dereferencedFieldValue(v reflect.Value) reflect.Value {
+	for k := v.Kind(); k == reflect.Ptr || k == reflect.Interface; k = v.Kind() {
+		if v.Type().Implements(typeOfSQLDriverValuer) {
+			break
+		}
+
 		v = v.Elem()
 	}
 

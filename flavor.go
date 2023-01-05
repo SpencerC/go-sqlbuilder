@@ -16,6 +16,7 @@ const (
 	PostgreSQL
 	SQLite
 	SQLServer
+	ClickHouse
 )
 
 var (
@@ -49,6 +50,8 @@ func (f Flavor) String() string {
 		return "SQLite"
 	case SQLServer:
 		return "SQLServer"
+	case ClickHouse:
+		return "ClickHouse"
 	}
 
 	return "<invalid>"
@@ -69,6 +72,8 @@ func (f Flavor) Interpolate(sql string, args []interface{}) (string, error) {
 		return sqliteInterpolate(sql, args...)
 	case SQLServer:
 		return sqlserverInterpolate(sql, args...)
+	case ClickHouse:
+		return clickhouseInterpolate(sql, args...)
 	}
 
 	return "", ErrInterpolateNotImplemented
@@ -119,15 +124,42 @@ func (f Flavor) NewUnionBuilder() *UnionBuilder {
 // Quote adds quote for name to make sure the name can be used safely
 // as table name or field name.
 //
-//     * For MySQL, use back quote (`) to quote name;
-//     * For PostgreSQL, SQL Server and SQLite, use double quote (") to quote name.
+//   - For MySQL, use back quote (`) to quote name;
+//   - For PostgreSQL, SQL Server and SQLite, use double quote (") to quote name.
 func (f Flavor) Quote(name string) string {
 	switch f {
-	case MySQL:
+	case MySQL, ClickHouse:
 		return fmt.Sprintf("`%s`", name)
 	case PostgreSQL, SQLServer, SQLite:
 		return fmt.Sprintf(`"%s"`, name)
 	}
 
 	return name
+}
+
+// PrepareInsertIgnore prepares the insert builder to build insert ignore SQL statement based on the sql flavor
+func (f Flavor) PrepareInsertIgnore(table string, ib *InsertBuilder) {
+	switch ib.args.Flavor {
+	case MySQL:
+		ib.verb = "INSERT IGNORE"
+	case PostgreSQL:
+		// see https://www.postgresql.org/docs/current/sql-insert.html
+		ib.verb = "INSERT"
+		// add sql statement at the end after values, i.e. INSERT INTO ... ON CONFLICT DO NOTHING
+		ib.marker = insertMarkerAfterValues
+		ib.SQL("ON CONFLICT DO NOTHING")
+	case SQLite:
+		// see https://www.sqlite.org/lang_insert.html
+		ib.verb = "INSERT OR IGNORE"
+	case ClickHouse:
+		// see https://clickhouse.tech/docs/en/sql-reference/statements/insert-into/
+		ib.verb = "INSERT"
+	default:
+		// panic if the db flavor is not supported
+		panic(fmt.Errorf("unsupported db flavor: %s", ib.args.Flavor.String()))
+	}
+
+	// Set the table and reset the marker right after insert into
+	ib.table = Escape(table)
+	ib.marker = insertMarkerAfterInsertInto
 }
